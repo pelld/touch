@@ -11,12 +11,13 @@
        00A — PAGE
        The whole page is the drawing surface. There is intentionally no UI.
        ====================================================================== */
-    html, body {
+    html,
+    body {
       width: 100%;
       height: 100%;
       margin: 0;
       overflow: hidden;
-      background: #fff;
+      background: #ffffff;
       overscroll-behavior: none;
     }
 
@@ -26,7 +27,8 @@
     }
 
     /* ======================================================================
-       00B — TOUCH SURFACE
+       00B — CANVAS
+       Browser gestures are disabled so touch belongs entirely to the artwork.
        ====================================================================== */
     #touchCanvas {
       position: absolute;
@@ -34,9 +36,10 @@
       width: 100%;
       height: 100%;
       display: block;
-      background: #fff;
+      background: #ffffff;
       touch-action: none;
       -webkit-tap-highlight-color: transparent;
+      cursor: crosshair;
     }
   </style>
 </head>
@@ -48,21 +51,18 @@
 
     /* ======================================================================
        01A — SETTINGS
-       Four seconds of LOCAL contact takes a surface area from white to black.
-       Contact width/height come from the device rather than a fixed brush.
+       Colour belongs to each area of the surface. Four seconds of accumulated
+       local contact moves that area from white through the spectrum to black.
        ====================================================================== */
     const HOLD_DURATION_MS = 4000;
+    const TOUCH_RADIUS_CSS_PX = 8;
+    const MOUSE_RADIUS_CSS_PX = 5;
+    const SOLID_CORE = 0.82;
     const MAX_DPR = 3;
 
-    const MOUSE_RADIUS_CSS_PX = 2;
-    const FALLBACK_TOUCH_RADIUS_CSS_PX = 3.5;
-    const MIN_TOUCH_HALF_SIZE_CSS_PX = 0.9;
-    const MAX_TOUCH_HALF_SIZE_CSS_PX = 35;
-    const SOLID_CORE = 0.97;
-
     /* ======================================================================
-       02A — CANVAS AND LOCAL DWELL-TIME MAP
-       Each backing pixel stores its own accumulated contact time.
+       02A — CANVAS AND LOCAL DWELL MAP
+       Every backing-canvas pixel stores its own accumulated touch duration.
        ====================================================================== */
     const canvas = document.getElementById('touchCanvas');
     const ctx = canvas.getContext('2d', { alpha: false });
@@ -73,8 +73,6 @@
 
     /* ======================================================================
        03A — COLOUR JOURNEY
-       white → yellow → orange → red → magenta → purple → blue → cyan → green
-       → deep green → black.
        ====================================================================== */
     const COLOUR_STOPS = [
       [0.00, 255, 255, 255],
@@ -100,10 +98,6 @@
       return t * t * (3 - 2 * t);
     }
 
-    function lerp(a, b, t) {
-      return a + (b - a) * t;
-    }
-
     function colourAt(progress) {
       const p = clamp(progress, 0, 1);
 
@@ -113,13 +107,13 @@
 
         if (p <= b[0]) {
           const span = b[0] - a[0];
-          const raw = span === 0 ? 0 : (p - a[0]) / span;
-          const mix = smoothstep(clamp(raw, 0, 1));
+          const rawMix = span === 0 ? 0 : (p - a[0]) / span;
+          const mix = smoothstep(clamp(rawMix, 0, 1));
 
           return {
-            r: Math.round(lerp(a[1], b[1], mix)),
-            g: Math.round(lerp(a[2], b[2], mix)),
-            b: Math.round(lerp(a[3], b[3], mix))
+            r: Math.round(a[1] + (b[1] - a[1]) * mix),
+            g: Math.round(a[2] + (b[2] - a[2]) * mix),
+            b: Math.round(a[3] + (b[3] - a[3]) * mix)
           };
         }
       }
@@ -166,7 +160,7 @@
     }
 
     /* ======================================================================
-       04B — RESIZE WITHOUT LOSING TOUCH HISTORY
+       04B — RESIZE WHILE PRESERVING THE ARTWORK
        ====================================================================== */
     function resizeCanvas() {
       const oldWidth = canvas.width;
@@ -201,7 +195,9 @@
     window.addEventListener('resize', resizeCanvas, { passive: true });
 
     /* ======================================================================
-       05A — POINTER POSITION
+       05A — POINTER HELPERS
+       The mark size is now intentionally uniform. Device-reported contact
+       geometry and pressure are ignored because they proved too noisy.
        ====================================================================== */
     const activePointers = new Map();
 
@@ -213,60 +209,28 @@
       };
     }
 
-    /* ======================================================================
-       05B — REAL CONTACT FOOTPRINT
-       PointerEvent.width/height describe the browser's estimate of the touch
-       contact geometry in CSS pixels. We use that geometry at essentially 1:1
-       scale: a narrow contact stays narrow; a broad finger pad stays broad.
-
-       Some devices expose no useful width/height. Only in that case do we use
-       a small pressure-sensitive fallback.
-       ====================================================================== */
-    function footprintFromEvent(event) {
-      if (event.pointerType === 'mouse') {
-        const radius = MOUSE_RADIUS_CSS_PX * dpr;
-        return { rx: radius, ry: radius };
-      }
-
-      const width = Number.isFinite(event.width) ? event.width : 0;
-      const height = Number.isFinite(event.height) ? event.height : 0;
-      const hasGeometry = width > 1 || height > 1;
-
-      let rxCss;
-      let ryCss;
-
-      if (hasGeometry) {
-        rxCss = clamp(width * 0.5, MIN_TOUCH_HALF_SIZE_CSS_PX, MAX_TOUCH_HALF_SIZE_CSS_PX);
-        ryCss = clamp(height * 0.5, MIN_TOUCH_HALF_SIZE_CSS_PX, MAX_TOUCH_HALF_SIZE_CSS_PX);
-      } else {
-        const pressure = event.pressure > 0 ? event.pressure : 0.5;
-        const fallback = FALLBACK_TOUCH_RADIUS_CSS_PX * (0.65 + pressure * 0.7);
-        rxCss = clamp(fallback, MIN_TOUCH_HALF_SIZE_CSS_PX, MAX_TOUCH_HALF_SIZE_CSS_PX);
-        ryCss = rxCss;
-      }
-
-      return { rx: rxCss * dpr, ry: ryCss * dpr };
+    function radiusFor(event) {
+      const cssRadius = event.pointerType === 'mouse' ? MOUSE_RADIUS_CSS_PX : TOUCH_RADIUS_CSS_PX;
+      return cssRadius * dpr;
     }
 
     /* ======================================================================
-       06A — ADD LOCAL TIME TO THE CONTACT FOOTPRINT
-       The browser gives width/height, not a full skin outline, so the closest
-       web representation is an ellipse. Only the final 3% is feathered.
+       06A — ADD LOCAL TIME TO ONE UNIFORM POINT
+       A mostly solid circular point has only a narrow soft edge. This keeps the
+       result clean and predictable while still avoiding jagged pixel edges.
        ====================================================================== */
-    function addDwellAt(cx, cy, rx, ry, elapsedMs) {
-      const safeRx = Math.max(rx, 0.5);
-      const safeRy = Math.max(ry, 0.5);
-      const minX = Math.max(0, Math.floor(cx - safeRx));
-      const maxX = Math.min(canvas.width - 1, Math.ceil(cx + safeRx));
-      const minY = Math.max(0, Math.floor(cy - safeRy));
-      const maxY = Math.min(canvas.height - 1, Math.ceil(cy + safeRy));
+    function addDwellAt(cx, cy, radius, elapsedMs) {
+      const minX = Math.max(0, Math.floor(cx - radius));
+      const maxX = Math.min(canvas.width - 1, Math.ceil(cx + radius));
+      const minY = Math.max(0, Math.floor(cy - radius));
+      const maxY = Math.min(canvas.height - 1, Math.ceil(cy + radius));
 
       for (let y = minY; y <= maxY; y += 1) {
         const row = y * canvas.width;
-        const ny = (y + 0.5 - cy) / safeRy;
+        const ny = (y + 0.5 - cy) / radius;
 
         for (let x = minX; x <= maxX; x += 1) {
-          const nx = (x + 0.5 - cx) / safeRx;
+          const nx = (x + 0.5 - cx) / radius;
           const distanceSquared = nx * nx + ny * ny;
           if (distanceSquared >= 1) continue;
 
@@ -292,16 +256,15 @@
     }
 
     /* ======================================================================
-       06B — MOVE THE ACTUAL FOOTPRINT THROUGH SPACE
-       Both position AND contact width/height are interpolated. Thus rolling
-       from a nail/edge onto a finger pad can widen the mark during one gesture.
+       06B — SPREAD ELAPSED TIME ALONG MOVEMENT
+       Time is divided among the positions crossed in that interval. A long
+       gesture therefore does not make newly visited areas jump towards black.
        ====================================================================== */
-    function addDwellAlongPath(fromX, fromY, fromRx, fromRy, toX, toY, toRx, toRy, elapsedMs) {
+    function addDwellAlongPath(fromX, fromY, toX, toY, radius, elapsedMs) {
       const dx = toX - fromX;
       const dy = toY - fromY;
       const distance = Math.hypot(dx, dy);
-      const smallestRadius = Math.max(0.75, Math.min(fromRx, fromRy, toRx, toRy));
-      const spacing = Math.max(0.75, smallestRadius * 0.4);
+      const spacing = Math.max(1, radius * 0.32);
       const steps = Math.max(1, Math.ceil(distance / spacing));
       const timePerStep = elapsedMs / steps;
       let dirty = null;
@@ -309,10 +272,9 @@
       for (let step = 0; step < steps; step += 1) {
         const mix = (step + 0.5) / steps;
         const rect = addDwellAt(
-          lerp(fromX, toX, mix),
-          lerp(fromY, toY, mix),
-          lerp(fromRx, toRx, mix),
-          lerp(fromRy, toRy, mix),
+          fromX + dx * mix,
+          fromY + dy * mix,
+          radius,
           timePerStep
         );
 
@@ -331,38 +293,30 @@
 
     function flushDirtyRect(rect) {
       if (!rect) return;
-      ctx.putImageData(
-        pixelBuffer,
-        0,
-        0,
-        rect.minX,
-        rect.minY,
-        rect.maxX - rect.minX + 1,
-        rect.maxY - rect.minY + 1
-      );
+      const width = rect.maxX - rect.minX + 1;
+      const height = rect.maxY - rect.minY + 1;
+      ctx.putImageData(pixelBuffer, 0, 0, rect.minX, rect.minY, width, height);
     }
 
     /* ======================================================================
-       07A — UPDATE A POINTER FROM THE FINEST AVAILABLE SAMPLE
-       getCoalescedEvents() can expose extra samples between normal browser
-       events. We use the latest one to improve position/contact geometry.
+       07A — PROCESS ONE POINTER SAMPLE
+       Coalesced samples are used when available purely for smoother movement;
+       they no longer alter the size of the mark.
        ====================================================================== */
-    function updatePointerFromEvent(event) {
-      const pointer = activePointers.get(event.pointerId);
-      if (!pointer) return;
+    function processSample(pointer, event, now) {
+      const point = canvasPoint(event);
+      const elapsedMs = Math.max(0, Math.min(50, now - pointer.lastTick));
 
-      let sample = event;
-      if (typeof event.getCoalescedEvents === 'function') {
-        const coalesced = event.getCoalescedEvents();
-        if (coalesced.length) sample = coalesced[coalesced.length - 1];
+      if (elapsedMs > 0) {
+        const dirty = addDwellAlongPath(pointer.lastX, pointer.lastY, point.x, point.y, pointer.radius, elapsedMs);
+        flushDirtyRect(dirty);
       }
 
-      const point = canvasPoint(sample);
-      const footprint = footprintFromEvent(sample);
       pointer.x = point.x;
       pointer.y = point.y;
-      pointer.rx = footprint.rx;
-      pointer.ry = footprint.ry;
+      pointer.lastX = point.x;
+      pointer.lastY = point.y;
+      pointer.lastTick = now;
     }
 
     /* ======================================================================
@@ -373,42 +327,43 @@
       canvas.setPointerCapture(event.pointerId);
 
       const point = canvasPoint(event);
-      const footprint = footprintFromEvent(event);
       const now = performance.now();
 
       activePointers.set(event.pointerId, {
         x: point.x,
         y: point.y,
-        rx: footprint.rx,
-        ry: footprint.ry,
         lastX: point.x,
         lastY: point.y,
-        lastRx: footprint.rx,
-        lastRy: footprint.ry,
+        radius: radiusFor(event),
         lastTick: now
       });
     });
 
     canvas.addEventListener('pointermove', (event) => {
+      const pointer = activePointers.get(event.pointerId);
+      if (!pointer) return;
       event.preventDefault();
-      updatePointerFromEvent(event);
-    });
 
-    // Chrome/Android may provide higher-frequency raw pointer updates.
-    canvas.addEventListener('pointerrawupdate', updatePointerFromEvent);
+      const samples = typeof event.getCoalescedEvents === 'function' ? event.getCoalescedEvents() : [];
+      const events = samples.length ? samples : [event];
+      const frameNow = performance.now();
+
+      for (let i = 0; i < events.length; i += 1) {
+        const sampleNow = i === events.length - 1 ? frameNow : pointer.lastTick + (frameNow - pointer.lastTick) / (events.length - i);
+        processSample(pointer, events[i], sampleNow);
+      }
+    });
 
     function finishPointer(event) {
       const pointer = activePointers.get(event.pointerId);
       if (!pointer) return;
 
       const now = performance.now();
-      const elapsedMs = Math.max(0, Math.min(50, now - pointer.lastTick));
-      const dirty = addDwellAlongPath(
-        pointer.lastX, pointer.lastY, pointer.lastRx, pointer.lastRy,
-        pointer.x, pointer.y, pointer.rx, pointer.ry,
-        elapsedMs
-      );
+      const point = canvasPoint(event);
+      const elapsedMs = Math.max(0, now - pointer.lastTick);
+      const dirty = addDwellAlongPath(pointer.lastX, pointer.lastY, point.x, point.y, pointer.radius, elapsedMs);
       flushDirtyRect(dirty);
+
       activePointers.delete(event.pointerId);
     }
 
@@ -417,26 +372,18 @@
     canvas.addEventListener('lostpointercapture', finishPointer);
 
     /* ======================================================================
-       08A — ANIMATION LOOP
-       A stationary contact continues accumulating time. A moving contact
-       spreads only the elapsed milliseconds across the actual area traversed.
+       08A — STATIONARY-HOLD ANIMATION
+       A finger that does not move still adds time to the same local point.
        ====================================================================== */
     function animate(now) {
       for (const pointer of activePointers.values()) {
         const elapsedMs = Math.max(0, Math.min(50, now - pointer.lastTick));
 
         if (elapsedMs > 0) {
-          const dirty = addDwellAlongPath(
-            pointer.lastX, pointer.lastY, pointer.lastRx, pointer.lastRy,
-            pointer.x, pointer.y, pointer.rx, pointer.ry,
-            elapsedMs
-          );
+          const dirty = addDwellAt(pointer.x, pointer.y, pointer.radius, elapsedMs);
           flushDirtyRect(dirty);
-
           pointer.lastX = pointer.x;
           pointer.lastY = pointer.y;
-          pointer.lastRx = pointer.rx;
-          pointer.lastRy = pointer.ry;
           pointer.lastTick = now;
         }
       }
