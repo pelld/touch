@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="theme-color" content="#ffffff">
+  <title>Touch</title>
+
+  <style>
+    /* ======================================================================
+       00A — PAGE
+       The canvas is the entire page. There is intentionally no visible UI.
+       ====================================================================== */
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #ffffff;
+      overscroll-behavior: none;
+    }
+
+    body {
+      position: fixed;
+      inset: 0;
+    }
+
+    /* ======================================================================
+       00B — TOUCH SURFACE
+       touch-action:none prevents scrolling/zoom gestures from stealing a draw.
+       ====================================================================== */
+    #touchCanvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      background: #ffffff;
+      touch-action: none;
+      cursor: crosshair;
+      -webkit-tap-highlight-color: transparent;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="touchCanvas" aria-label="Touch and hold to paint colour"></canvas>
+
+  <script>
+    'use strict';
+
+    /* ======================================================================
+       01A — SETTINGS
+       HOLD_DURATION_MS controls the full white → colour spectrum → black trip.
+       Radius is deliberately close to a fingertip rather than a paint brush.
+       ====================================================================== */
+    const HOLD_DURATION_MS = 4000;
+    const TOUCH_RADIUS_CSS_PX = 34;
+    const MOUSE_RADIUS_CSS_PX = 24;
+    const EDGE_SOFTNESS = 0.28;
+
+    /* ======================================================================
+       02A — CANVAS SETUP
+       Draw in device pixels so the marks stay crisp on high-density phones.
+       Existing artwork is preserved when the screen rotates or resizes.
+       ====================================================================== */
+    const canvas = document.getElementById('touchCanvas');
+    const ctx = canvas.getContext('2d', { alpha: false });
+
+    let cssWidth = 0;
+    let cssHeight = 0;
+    let dpr = 1;
+
+    function resizeCanvas() {
+      const nextWidth = window.innerWidth;
+      const nextHeight = window.innerHeight;
+      const nextDpr = Math.min(window.devicePixelRatio || 1, 3);
+
+      const oldCanvas = document.createElement('canvas');
+      oldCanvas.width = canvas.width;
+      oldCanvas.height = canvas.height;
+      if (canvas.width && canvas.height) {
+        oldCanvas.getContext('2d').drawImage(canvas, 0, 0);
+      }
+
+      cssWidth = nextWidth;
+      cssHeight = nextHeight;
+      dpr = nextDpr;
+
+      canvas.width = Math.max(1, Math.round(cssWidth * dpr));
+      canvas.height = Math.max(1, Math.round(cssHeight * dpr));
+
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      if (oldCanvas.width && oldCanvas.height) {
+        ctx.drawImage(oldCanvas, 0, 0, oldCanvas.width, oldCanvas.height, 0, 0, canvas.width, canvas.height);
+      }
+    }
+
+    resizeCanvas();
+    window.addEventListener('resize', resizeCanvas, { passive: true });
+
+    /* ======================================================================
+       03A — COLOUR JOURNEY
+       The sequence is intentionally perceptual rather than a simple greyscale:
+       white → yellow → orange → red → magenta → purple → blue → cyan → green
+       → deep green → black.
+
+       Each stop is [progress, red, green, blue]. Progress runs from 0 to 1.
+       More time is given to the vivid middle colours than to white/black.
+       ====================================================================== */
+    const COLOUR_STOPS = [
+      [0.00, 255, 255, 255],
+      [0.08, 255, 248, 176],
+      [0.16, 255, 214,  64],
+      [0.25, 255, 132,  34],
+      [0.34, 242,  48,  48],
+      [0.43, 230,  48, 145],
+      [0.52, 159,  61, 217],
+      [0.61,  68,  78, 226],
+      [0.70,  32, 178, 218],
+      [0.79,  42, 201, 135],
+      [0.87,  17, 116,  72],
+      [0.94,  10,  48,  32],
+      [1.00,   0,   0,   0]
+    ];
+
+    function smoothstep(t) {
+      return t * t * (3 - 2 * t);
+    }
+
+    function colourAt(progress) {
+      const p = Math.max(0, Math.min(1, progress));
+
+      for (let i = 0; i < COLOUR_STOPS.length - 1; i += 1) {
+        const a = COLOUR_STOPS[i];
+        const b = COLOUR_STOPS[i + 1];
+
+        if (p <= b[0]) {
+          const span = b[0] - a[0];
+          const rawMix = span === 0 ? 0 : (p - a[0]) / span;
+          const mix = smoothstep(Math.max(0, Math.min(1, rawMix)));
+
+          return {
+            r: Math.round(a[1] + (b[1] - a[1]) * mix),
+            g: Math.round(a[2] + (b[2] - a[2]) * mix),
+            b: Math.round(a[3] + (b[3] - a[3]) * mix)
+          };
+        }
+      }
+
+      return { r: 0, g: 0, b: 0 };
+    }
+
+    /* ======================================================================
+       04A — ACTIVE TOUCHES
+       Each finger has its own clock, position and previous paint position.
+       Multi-touch therefore works naturally: two fingers can be at different
+       colours at the same time.
+       ====================================================================== */
+    const activePointers = new Map();
+
+    function canvasPoint(event) {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: (event.clientX - rect.left) * dpr,
+        y: (event.clientY - rect.top) * dpr
+      };
+    }
+
+    function pointerRadius(event) {
+      const cssRadius = event.pointerType === 'mouse' ? MOUSE_RADIUS_CSS_PX : TOUCH_RADIUS_CSS_PX;
+      return cssRadius * dpr;
+    }
+
+    /* ======================================================================
+       05A — PAINT DAB
+       A soft radial edge keeps individual touches organic without affecting
+       any pixels beyond the fingertip-sized circle.
+       ====================================================================== */
+    function paintDab(x, y, radius, colour) {
+      const innerRadius = radius * (1 - EDGE_SOFTNESS);
+      const gradient = ctx.createRadialGradient(x, y, innerRadius, x, y, radius);
+      const rgb = `${colour.r}, ${colour.g}, ${colour.b}`;
+
+      gradient.addColorStop(0, `rgb(${rgb})`);
+      gradient.addColorStop(0.72, `rgb(${rgb})`);
+      gradient.addColorStop(1, `rgba(${rgb}, 0)`);
+
+      ctx.fillStyle = gradient;
+      ctx.beginPath();
+      ctx.arc(x, y, radius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    /* ======================================================================
+       05B — PAINT BETWEEN TWO POSITIONS
+       Interpolation prevents gaps when a finger moves quickly across the page.
+       ====================================================================== */
+    function paintStroke(pointer, colour) {
+      const dx = pointer.x - pointer.lastPaintX;
+      const dy = pointer.y - pointer.lastPaintY;
+      const distance = Math.hypot(dx, dy);
+      const spacing = Math.max(1, pointer.radius * 0.18);
+      const steps = Math.max(1, Math.ceil(distance / spacing));
+
+      for (let step = 1; step <= steps; step += 1) {
+        const mix = step / steps;
+        const x = pointer.lastPaintX + dx * mix;
+        const y = pointer.lastPaintY + dy * mix;
+        paintDab(x, y, pointer.radius, colour);
+      }
+
+      pointer.lastPaintX = pointer.x;
+      pointer.lastPaintY = pointer.y;
+    }
+
+    /* ======================================================================
+       06A — POINTER EVENTS
+       A press begins its own four-second colour journey. Releasing freezes
+       whatever has been painted; the artwork is never cleared automatically.
+       ====================================================================== */
+    canvas.addEventListener('pointerdown', (event) => {
+      event.preventDefault();
+      canvas.setPointerCapture(event.pointerId);
+
+      const point = canvasPoint(event);
+      const now = performance.now();
+
+      activePointers.set(event.pointerId, {
+        x: point.x,
+        y: point.y,
+        lastPaintX: point.x,
+        lastPaintY: point.y,
+        radius: pointerRadius(event),
+        startedAt: now
+      });
+
+      // An immediate white dab makes the interaction start exactly at white.
+      paintDab(point.x, point.y, pointerRadius(event), colourAt(0));
+    });
+
+    canvas.addEventListener('pointermove', (event) => {
+      const pointer = activePointers.get(event.pointerId);
+      if (!pointer) return;
+
+      event.preventDefault();
+      const point = canvasPoint(event);
+      pointer.x = point.x;
+      pointer.y = point.y;
+    });
+
+    function endPointer(event) {
+      const pointer = activePointers.get(event.pointerId);
+      if (!pointer) return;
+
+      const elapsed = performance.now() - pointer.startedAt;
+      const progress = Math.min(1, elapsed / HOLD_DURATION_MS);
+      paintStroke(pointer, colourAt(progress));
+      activePointers.delete(event.pointerId);
+    }
+
+    canvas.addEventListener('pointerup', endPointer);
+    canvas.addEventListener('pointercancel', endPointer);
+    canvas.addEventListener('lostpointercapture', endPointer);
+
+    /* ======================================================================
+       07A — ANIMATION LOOP
+       This is what makes a stationary finger continue changing colour while
+       it is held down. The same small patch is repainted as its clock advances.
+       ====================================================================== */
+    function animate(now) {
+      for (const pointer of activePointers.values()) {
+        const elapsed = now - pointer.startedAt;
+        const progress = Math.min(1, elapsed / HOLD_DURATION_MS);
+        paintStroke(pointer, colourAt(progress));
+      }
+
+      requestAnimationFrame(animate);
+    }
+
+    requestAnimationFrame(animate);
+
+    /* ======================================================================
+       08A — BROWSER GESTURE GUARDS
+       Keep long-press menus and drag behaviour from interrupting the canvas.
+       ====================================================================== */
+    canvas.addEventListener('contextmenu', (event) => event.preventDefault());
+    canvas.addEventListener('dragstart', (event) => event.preventDefault());
+  </script>
+</body>
+</html>
