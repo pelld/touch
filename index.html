@@ -51,18 +51,22 @@
 
     /* ======================================================================
        01A — SETTINGS
-       HOLD_DURATION_MS controls the full white → colour spectrum → black trip.
-       Radius is deliberately close to a fingertip rather than a paint brush.
+       Four seconds of LOCAL contact takes an area from white to black.
+       The brush is deliberately much smaller than a fingertip so detailed
+       marks are possible even though the finger itself obscures the canvas.
        ====================================================================== */
     const HOLD_DURATION_MS = 4000;
-    const TOUCH_RADIUS_CSS_PX = 34;
-    const MOUSE_RADIUS_CSS_PX = 24;
-    const EDGE_SOFTNESS = 0.28;
+    const FALLBACK_TOUCH_RADIUS_CSS_PX = 9;
+    const MIN_TOUCH_RADIUS_CSS_PX = 6;
+    const MAX_TOUCH_RADIUS_CSS_PX = 14;
+    const MOUSE_RADIUS_CSS_PX = 6;
+    const SOLID_CORE = 0.60;
+    const MAX_DPR = 3;
 
     /* ======================================================================
-       02A — CANVAS SETUP
-       Draw in device pixels so the marks stay crisp on high-density phones.
-       Existing artwork is preserved when the screen rotates or resizes.
+       02A — CANVAS AND LOCAL DWELL-TIME MAP
+       Every backing-canvas pixel stores its own accumulated touch time.
+       Colour is therefore a property of the surface, not of the finger.
        ====================================================================== */
     const canvas = document.getElementById('touchCanvas');
     const ctx = canvas.getContext('2d', { alpha: false });
@@ -70,45 +74,13 @@
     let cssWidth = 0;
     let cssHeight = 0;
     let dpr = 1;
-
-    function resizeCanvas() {
-      const nextWidth = window.innerWidth;
-      const nextHeight = window.innerHeight;
-      const nextDpr = Math.min(window.devicePixelRatio || 1, 3);
-
-      const oldCanvas = document.createElement('canvas');
-      oldCanvas.width = canvas.width;
-      oldCanvas.height = canvas.height;
-      if (canvas.width && canvas.height) {
-        oldCanvas.getContext('2d').drawImage(canvas, 0, 0);
-      }
-
-      cssWidth = nextWidth;
-      cssHeight = nextHeight;
-      dpr = nextDpr;
-
-      canvas.width = Math.max(1, Math.round(cssWidth * dpr));
-      canvas.height = Math.max(1, Math.round(cssHeight * dpr));
-
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-      if (oldCanvas.width && oldCanvas.height) {
-        ctx.drawImage(oldCanvas, 0, 0, oldCanvas.width, oldCanvas.height, 0, 0, canvas.width, canvas.height);
-      }
-    }
-
-    resizeCanvas();
-    window.addEventListener('resize', resizeCanvas, { passive: true });
+    let dwellMs = new Float32Array(0);
+    let pixelBuffer = null;
 
     /* ======================================================================
        03A — COLOUR JOURNEY
-       The sequence is intentionally perceptual rather than a simple greyscale:
        white → yellow → orange → red → magenta → purple → blue → cyan → green
        → deep green → black.
-
-       Each stop is [progress, red, green, blue]. Progress runs from 0 to 1.
-       More time is given to the vivid middle colours than to white/black.
        ====================================================================== */
     const COLOUR_STOPS = [
       [0.00, 255, 255, 255],
@@ -154,12 +126,97 @@
     }
 
     /* ======================================================================
-       04A — ACTIVE TOUCHES
-       Each finger has its own clock, position and previous paint position.
-       Multi-touch therefore works naturally: two fingers can be at different
-       colours at the same time.
+       03B — PRECOMPUTED COLOUR LOOKUP
+       Thousands of tiny surface cells can change each frame. A lookup table
+       keeps that fast enough for phones while retaining smooth colour changes.
+       ====================================================================== */
+    const LUT_STEPS = 1024;
+    const colourLut = new Uint8ClampedArray((LUT_STEPS + 1) * 3);
+
+    for (let step = 0; step <= LUT_STEPS; step += 1) {
+      const colour = colourAt(step / LUT_STEPS);
+      const offset = step * 3;
+      colourLut[offset] = colour.r;
+      colourLut[offset + 1] = colour.g;
+      colourLut[offset + 2] = colour.b;
+    }
+
+    /* ======================================================================
+       04A — PIXEL BUFFER HELPERS
+       The visible canvas is rebuilt from the dwell-time map. This means an
+       old mark can be touched again later and continues from its old colour.
+       ====================================================================== */
+    function writePixel(pixelIndex) {
+      const progress = Math.min(1, dwellMs[pixelIndex] / HOLD_DURATION_MS);
+      const lutIndex = Math.round(progress * LUT_STEPS) * 3;
+      const pixelOffset = pixelIndex * 4;
+
+      pixelBuffer.data[pixelOffset] = colourLut[lutIndex];
+      pixelBuffer.data[pixelOffset + 1] = colourLut[lutIndex + 1];
+      pixelBuffer.data[pixelOffset + 2] = colourLut[lutIndex + 2];
+      pixelBuffer.data[pixelOffset + 3] = 255;
+    }
+
+    function rebuildPixelBuffer() {
+      pixelBuffer = ctx.createImageData(canvas.width, canvas.height);
+
+      for (let i = 0; i < dwellMs.length; i += 1) {
+        writePixel(i);
+      }
+
+      ctx.putImageData(pixelBuffer, 0, 0);
+    }
+
+    /* ======================================================================
+       04B — RESIZE WITHOUT LOSING THE PAINTING OR ITS TOUCH HISTORY
+       The old dwell-time map is resampled into the new canvas dimensions.
+       ====================================================================== */
+    function resizeCanvas() {
+      const oldWidth = canvas.width;
+      const oldHeight = canvas.height;
+      const oldDwell = dwellMs;
+
+      cssWidth = window.innerWidth;
+      cssHeight = window.innerHeight;
+      dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
+
+      const newWidth = Math.max(1, Math.round(cssWidth * dpr));
+      const newHeight = Math.max(1, Math.round(cssHeight * dpr));
+
+      canvas.width = newWidth;
+      canvas.height = newHeight;
+      dwellMs = new Float32Array(newWidth * newHeight);
+
+      if (oldWidth > 0 && oldHeight > 0 && oldDwell.length > 0) {
+        for (let y = 0; y < newHeight; y += 1) {
+          const oldY = Math.min(oldHeight - 1, Math.floor(y * oldHeight / newHeight));
+          const newRow = y * newWidth;
+          const oldRow = oldY * oldWidth;
+
+          for (let x = 0; x < newWidth; x += 1) {
+            const oldX = Math.min(oldWidth - 1, Math.floor(x * oldWidth / newWidth));
+            dwellMs[newRow + x] = oldDwell[oldRow + oldX];
+          }
+        }
+      }
+
+      rebuildPixelBuffer();
+    }
+
+    resizeCanvas();
+    window.addEventListener('resize', resizeCanvas, { passive: true });
+
+    /* ======================================================================
+       05A — POINTER POSITION AND PRECISE BRUSH SIZE
+       Touch browsers often report the contact width/height. We use a reduced
+       version of that ellipse, with tight limits, rather than a large fixed
+       circle. Devices that do not report contact size use a small fallback.
        ====================================================================== */
     const activePointers = new Map();
+
+    function clamp(value, min, max) {
+      return Math.max(min, Math.min(max, value));
+    }
 
     function canvasPoint(event) {
       const rect = canvas.getBoundingClientRect();
@@ -169,76 +226,126 @@
       };
     }
 
-    function pointerRadius(event) {
-      const cssRadius = event.pointerType === 'mouse' ? MOUSE_RADIUS_CSS_PX : TOUCH_RADIUS_CSS_PX;
-      return cssRadius * dpr;
-    }
-
-    /* ======================================================================
-       05A — PAINT DAB
-       A soft radial edge keeps individual touches organic without affecting
-       any pixels beyond the fingertip-sized circle.
-       ====================================================================== */
-    function paintDab(x, y, radius, colour) {
-      const innerRadius = radius * (1 - EDGE_SOFTNESS);
-      const gradient = ctx.createRadialGradient(x, y, innerRadius, x, y, radius);
-      const rgb = `${colour.r}, ${colour.g}, ${colour.b}`;
-
-      gradient.addColorStop(0, `rgb(${rgb})`);
-      gradient.addColorStop(0.72, `rgb(${rgb})`);
-      gradient.addColorStop(1, `rgba(${rgb}, 0)`);
-
-      ctx.fillStyle = gradient;
-      ctx.beginPath();
-      ctx.arc(x, y, radius, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    /* ======================================================================
-       05B — PAINT BETWEEN TWO POSITIONS
-       Interpolation prevents gaps when a finger moves quickly across the page.
-       ====================================================================== */
-    function paintStroke(pointer, colour) {
-      const dx = pointer.x - pointer.lastPaintX;
-      const dy = pointer.y - pointer.lastPaintY;
-      const distance = Math.hypot(dx, dy);
-      const spacing = Math.max(1, pointer.radius * 0.18);
-      const steps = Math.max(1, Math.ceil(distance / spacing));
-
-      for (let step = 1; step <= steps; step += 1) {
-        const mix = step / steps;
-        const x = pointer.lastPaintX + dx * mix;
-        const y = pointer.lastPaintY + dy * mix;
-        paintDab(x, y, pointer.radius, colour);
+    function brushSize(event) {
+      if (event.pointerType === 'mouse') {
+        const radius = MOUSE_RADIUS_CSS_PX * dpr;
+        return { rx: radius, ry: radius };
       }
 
-      pointer.lastPaintX = pointer.x;
-      pointer.lastPaintY = pointer.y;
+      const reportedWidth = event.width > 1 ? event.width : FALLBACK_TOUCH_RADIUS_CSS_PX * 2;
+      const reportedHeight = event.height > 1 ? event.height : FALLBACK_TOUCH_RADIUS_CSS_PX * 2;
+
+      const rxCss = clamp(reportedWidth * 0.34, MIN_TOUCH_RADIUS_CSS_PX, MAX_TOUCH_RADIUS_CSS_PX);
+      const ryCss = clamp(reportedHeight * 0.34, MIN_TOUCH_RADIUS_CSS_PX, MAX_TOUCH_RADIUS_CSS_PX);
+
+      return { rx: rxCss * dpr, ry: ryCss * dpr };
     }
 
     /* ======================================================================
-       06A — POINTER EVENTS
-       A press begins its own four-second colour journey. Releasing freezes
-       whatever has been painted; the artwork is never cleared automatically.
+       06A — ADD LOCAL TOUCH TIME TO ONE SMALL AREA
+       The centre receives the full elapsed time. Only the outer edge feathers,
+       which avoids the obvious stamped-circle look without making marks fuzzy.
+       ====================================================================== */
+    function addDwellAt(cx, cy, rx, ry, elapsedMs) {
+      const minX = Math.max(0, Math.floor(cx - rx));
+      const maxX = Math.min(canvas.width - 1, Math.ceil(cx + rx));
+      const minY = Math.max(0, Math.floor(cy - ry));
+      const maxY = Math.min(canvas.height - 1, Math.ceil(cy + ry));
+
+      for (let y = minY; y <= maxY; y += 1) {
+        const row = y * canvas.width;
+        const ny = (y + 0.5 - cy) / ry;
+
+        for (let x = minX; x <= maxX; x += 1) {
+          const nx = (x + 0.5 - cx) / rx;
+          const distanceSquared = nx * nx + ny * ny;
+          if (distanceSquared >= 1) continue;
+
+          const distance = Math.sqrt(distanceSquared);
+          let weight = 1;
+
+          if (distance > SOLID_CORE) {
+            const edgePosition = (1 - distance) / (1 - SOLID_CORE);
+            weight = smoothstep(clamp(edgePosition, 0, 1));
+          }
+
+          const pixelIndex = row + x;
+          const nextDwell = Math.min(HOLD_DURATION_MS, dwellMs[pixelIndex] + elapsedMs * weight);
+
+          if (nextDwell !== dwellMs[pixelIndex]) {
+            dwellMs[pixelIndex] = nextDwell;
+            writePixel(pixelIndex);
+          }
+        }
+      }
+
+      return { minX, minY, maxX, maxY };
+    }
+
+    /* ======================================================================
+       06B — ADD TIME ALONG A MOVING FINGER'S PATH
+       Crucially, elapsed time is DIVIDED among the intermediate positions.
+       A fast swipe therefore gives each area only a brief touch rather than
+       inheriting the total age of the gesture and eventually painting black.
+       ====================================================================== */
+    function addDwellAlongPath(fromX, fromY, toX, toY, rx, ry, elapsedMs) {
+      const dx = toX - fromX;
+      const dy = toY - fromY;
+      const distance = Math.hypot(dx, dy);
+      const spacing = Math.max(1, Math.min(rx, ry) * 0.42);
+      const steps = Math.max(1, Math.ceil(distance / spacing));
+      const timePerStep = elapsedMs / steps;
+
+      let dirty = null;
+
+      for (let step = 0; step < steps; step += 1) {
+        const mix = (step + 0.5) / steps;
+        const x = fromX + dx * mix;
+        const y = fromY + dy * mix;
+        const rect = addDwellAt(x, y, rx, ry, timePerStep);
+
+        if (!dirty) {
+          dirty = rect;
+        } else {
+          dirty.minX = Math.min(dirty.minX, rect.minX);
+          dirty.minY = Math.min(dirty.minY, rect.minY);
+          dirty.maxX = Math.max(dirty.maxX, rect.maxX);
+          dirty.maxY = Math.max(dirty.maxY, rect.maxY);
+        }
+      }
+
+      return dirty;
+    }
+
+    function flushDirtyRect(rect) {
+      if (!rect) return;
+      const width = rect.maxX - rect.minX + 1;
+      const height = rect.maxY - rect.minY + 1;
+      ctx.putImageData(pixelBuffer, 0, 0, rect.minX, rect.minY, width, height);
+    }
+
+    /* ======================================================================
+       07A — POINTER EVENTS
+       Pointer objects track movement only. They deliberately do NOT store a
+       gesture start time because colour no longer belongs to the gesture.
        ====================================================================== */
     canvas.addEventListener('pointerdown', (event) => {
       event.preventDefault();
       canvas.setPointerCapture(event.pointerId);
 
       const point = canvasPoint(event);
+      const brush = brushSize(event);
       const now = performance.now();
 
       activePointers.set(event.pointerId, {
         x: point.x,
         y: point.y,
-        lastPaintX: point.x,
-        lastPaintY: point.y,
-        radius: pointerRadius(event),
-        startedAt: now
+        lastX: point.x,
+        lastY: point.y,
+        rx: brush.rx,
+        ry: brush.ry,
+        lastTick: now
       });
-
-      // An immediate white dab makes the interaction start exactly at white.
-      paintDab(point.x, point.y, pointerRadius(event), colourAt(0));
     });
 
     canvas.addEventListener('pointermove', (event) => {
@@ -247,34 +354,54 @@
 
       event.preventDefault();
       const point = canvasPoint(event);
+      const brush = brushSize(event);
+
       pointer.x = point.x;
       pointer.y = point.y;
+      pointer.rx = brush.rx;
+      pointer.ry = brush.ry;
     });
 
-    function endPointer(event) {
+    function finishPointer(event) {
       const pointer = activePointers.get(event.pointerId);
       if (!pointer) return;
 
-      const elapsed = performance.now() - pointer.startedAt;
-      const progress = Math.min(1, elapsed / HOLD_DURATION_MS);
-      paintStroke(pointer, colourAt(progress));
+      if (event.clientX !== undefined && event.clientY !== undefined) {
+        const point = canvasPoint(event);
+        pointer.x = point.x;
+        pointer.y = point.y;
+      }
+
+      const now = performance.now();
+      const elapsedMs = Math.max(0, now - pointer.lastTick);
+      const dirty = addDwellAlongPath(pointer.lastX, pointer.lastY, pointer.x, pointer.y, pointer.rx, pointer.ry, elapsedMs);
+      flushDirtyRect(dirty);
+
       activePointers.delete(event.pointerId);
     }
 
-    canvas.addEventListener('pointerup', endPointer);
-    canvas.addEventListener('pointercancel', endPointer);
-    canvas.addEventListener('lostpointercapture', endPointer);
+    canvas.addEventListener('pointerup', finishPointer);
+    canvas.addEventListener('pointercancel', finishPointer);
+    canvas.addEventListener('lostpointercapture', finishPointer);
 
     /* ======================================================================
-       07A — ANIMATION LOOP
-       This is what makes a stationary finger continue changing colour while
-       it is held down. The same small patch is repainted as its clock advances.
+       08A — ANIMATION LOOP
+       Each frame adds only the milliseconds since the previous frame to the
+       small areas actually crossed during that interval. A stationary hold
+       accumulates steadily; a moving finger spreads those milliseconds out.
        ====================================================================== */
     function animate(now) {
       for (const pointer of activePointers.values()) {
-        const elapsed = now - pointer.startedAt;
-        const progress = Math.min(1, elapsed / HOLD_DURATION_MS);
-        paintStroke(pointer, colourAt(progress));
+        const elapsedMs = Math.max(0, Math.min(50, now - pointer.lastTick));
+
+        if (elapsedMs > 0) {
+          const dirty = addDwellAlongPath(pointer.lastX, pointer.lastY, pointer.x, pointer.y, pointer.rx, pointer.ry, elapsedMs);
+          flushDirtyRect(dirty);
+
+          pointer.lastX = pointer.x;
+          pointer.lastY = pointer.y;
+          pointer.lastTick = now;
+        }
       }
 
       requestAnimationFrame(animate);
@@ -283,7 +410,7 @@
     requestAnimationFrame(animate);
 
     /* ======================================================================
-       08A — BROWSER GESTURE GUARDS
+       09A — BROWSER GESTURE GUARDS
        Keep long-press menus and drag behaviour from interrupting the canvas.
        ====================================================================== */
     canvas.addEventListener('contextmenu', (event) => event.preventDefault());
